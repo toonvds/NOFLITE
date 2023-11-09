@@ -29,12 +29,16 @@ class DataModule(pl.LightningDataModule):
         x_train, yf_train, t_train = self.dataset.get_train_data()
         x_val, yf_val, t_val = self.dataset.get_val_data()
         x_train_val, yf_train_val, t_train_val = self.dataset.get_train_val_data()
-        x_test, yf_test, yc_test, t_test = self.dataset.get_test_data()
+        x_test, yf_test, yc_test, t_test, ite_sample_test = self.dataset.get_test_data()
 
         if dataset.__name__ == 'SyntheticCI' or dataset.__name__ == 'EDU' or dataset.__name__ == 'IHDP':
             ite_l_test, ite_r_test = self.dataset.get_ci_data()
             self.ite_l_test = torch.from_numpy(ite_l_test).float()
             self.ite_r_test = torch.from_numpy(ite_r_test).float()
+
+            opt_treatment = self.dataset.get_opt_treatment()
+
+            self.opt_treatment = opt_treatment  # Optimal treatment for given utility function
 
         # # Standardize
         # # Only data without CIs (to keep left and right limits)
@@ -79,6 +83,7 @@ class DataModule(pl.LightningDataModule):
         self.yf_test_tensor = torch.from_numpy(yf_test).float()
         self.yc_test_tensor = torch.from_numpy(yc_test).float()
         self.t_test_tensor = torch.from_numpy(t_test).float()
+        self.ite_sample_test = torch.from_numpy(ite_sample_test).float()  # Random ITE sample for LL and coverage
 
         self.training_dataset = TensorDataset(self.x_train_tensor, self.yf_train_tensor, self.t_train_tensor)
         self.validation_dataset = TensorDataset(self.x_val_tensor, self.yf_val_tensor, self.t_val_tensor)
@@ -139,9 +144,24 @@ class IHDP(Dataset):
         self.yc_test[self.t_test == 1] = self.mu0[self.t_test == 1]
         self.yc_test[self.t_test == 0] = self.mu1[self.t_test == 0]
 
+        # Take one test sample to calculate the coverage of the CI
+        self.ite_sample_test = np.zeros_like(self.mu0)
+        yf_test_sample = data_test['yf'][:, iteration][:, np.newaxis]
+        yc_test_sample = data_test['ycf'][:, iteration][:, np.newaxis]
+
+        self.ite_sample_test[self.t_test == 1] = yf_test_sample[self.t_test == 1] - yc_test_sample[self.t_test == 1]
+        self.ite_sample_test[self.t_test == 0] = yc_test_sample[self.t_test == 0] - yf_test_sample[self.t_test == 0]
+        self.ite_sample_test = self.ite_sample_test[:, 0]
+
         # 90% CI:
         self.ite_l_test = (self.mu1 - self.mu0) - 1.959963984540 * 1
         self.ite_r_test = (self.mu1 - self.mu0) + 1.959963984540 * 1
+
+        # Optimal treatment given utility function (based on 100k samples):
+        expected_utility = ((np.random.normal(self.mu1 - self.mu0, np.ones_like(self.mu0),
+                                              size=(len(self.mu0), 100000)) - 4) ** 3).mean(axis=1)
+        self.opt_treatment = np.zeros(len(self.mu0))
+        self.opt_treatment[expected_utility > 0] = 1  # Treat instances where utility is positive
 
         self.x_train, self.x_val, self.yf_train, self.yf_val, self.t_train, self.t_val = \
             train_test_split(self.x_train_val, self.yf_train_val, self.t_train_val, test_size=0.10, random_state=0)
@@ -168,10 +188,13 @@ class IHDP(Dataset):
         """
         Returns test data
         """
-        return self.x_test, self.yf_test, self.yc_test, self.t_test
+        return self.x_test, self.yf_test, self.yc_test, self.t_test, self.ite_sample_test
 
     def get_ci_data(self):
         return self.ite_l_test, self.ite_r_test
+
+    def get_opt_treatment(self):
+        return self.opt_treatment
 
 
 class EDU(Dataset):
@@ -204,6 +227,13 @@ class EDU(Dataset):
         self.yc_test[self.t_test == 1] = self.mu0[self.t_test == 1]
         self.yc_test[self.t_test == 0] = self.mu1[self.t_test == 0]
 
+        # Take one test sample to calculate the coverage of the CI
+        # self.ite_sample_test = np.zeros_like(self.mu0)
+        # y0_test_sample = data_test[:, 1]
+        # y1_test_sample = data_test[:, 2]
+
+        self.ite_sample_test = (data_test[:, 2] - data_test[:, 1])
+
         # Add CI left and right for test set
         M = self.x_test[:, 23]
         # widthexp = (stats.expon.ppf(0.95, scale=0.5) - stats.expon.ppf(0.05, scale=0.5)) * (
@@ -215,6 +245,11 @@ class EDU(Dataset):
                       - (2 - M)[:, None].repeat(100000, axis=1) * np.random.normal(0, 0.5, (len(M), 100000))
         self.ite_l_test = np.percentile(a=ite_samples, q=5, axis=1)[:, None]
         self.ite_r_test = np.percentile(a=ite_samples, q=95, axis=1)[:, None]
+
+        # Optimal treatment given utility function (based on 100k samples):
+        expected_utility = ((ite_samples - 1) ** 3).mean(axis=1)
+        self.opt_treatment = np.zeros(len(self.mu0))
+        self.opt_treatment[expected_utility > 0] = 1  # Treat instances where utility is positive
 
         # No counterfactual Y during training/validation
         self.x_train, self.x_val, self.yf_train, self.yf_val, self.t_train, self.t_val = \
@@ -242,10 +277,13 @@ class EDU(Dataset):
         """
         Returns test data
         """
-        return self.x_test, self.yf_test, self.yc_test, self.t_test
+        return self.x_test, self.yf_test, self.yc_test, self.t_test, self.ite_sample_test
 
     def get_ci_data(self):
         return self.ite_l_test, self.ite_r_test
+
+    def get_opt_treatment(self):
+        return self.opt_treatment
 
 
 class Twins(Dataset):
@@ -372,6 +410,18 @@ class News(Dataset):
         self.x_train, self.x_val, self.yf_train, self.yf_val, self.t_train, self.t_val = \
             train_test_split(self.x_train_val, self.yf_train_val, self.t_train_val, test_size=0.1, random_state=0)
 
+        self.ite_sample_test = np.zeros_like(self.yc_test)
+        self.ite_sample_test[self.t_test == 0] = self.yc_test[self.t_test == 0] - self.yf_test[self.t_test == 0]
+        self.ite_sample_test[self.t_test == 1] = self.yf_test[self.t_test == 1] - self.yc_test[self.t_test == 1]
+        self.ite_sample_test = self.ite_sample_test[:, 0]
+
+        # Save to csv file
+        # np.savetxt("datasets/News/NEWS_csv/csv_R/News_train_iter_" + str(iteration + 1) + ".csv",
+        #            np.concatenate((self.x_train_val, self.t_train_val[:, None], self.yf_train_val), axis=1),
+        #            delimiter=",")
+        # np.savetxt("datasets/News/NEWS_csv/csv_R/News_test_iter_" + str(iteration + 1) + ".csv",
+        #            np.concatenate((self.x_test, self.t_test[:, None], self.yf_test, self.yc_test), axis=1),
+        #            delimiter=",")
 
     def get_train_data(self):
         """
@@ -395,7 +445,7 @@ class News(Dataset):
         """
         Returns test data
         """
-        return self.x_test, self.yf_test, self.yc_test, self.t_test
+        return self.x_test, self.yf_test, self.yc_test, self.t_test, self.ite_sample_test
 
 
 class LBIDD:
