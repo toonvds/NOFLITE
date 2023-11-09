@@ -11,14 +11,15 @@ from pytorch_lightning.callbacks import EarlyStopping, StochasticWeightAveraging
 from pytorch_lightning.loggers import WandbLogger
 from data_loading import DataModule, IHDP, LBIDD, News, Synthetic, SyntheticGMM, SyntheticCI, Twins, EDU
 from noflite import Noflite
-from benchmarks.ganite.ganite import ganite, ganite_prob
-from benchmarks.cevae import cevae
-from benchmarks.fccn import FCCN
 from cmgp import CMGP
+from benchmarks.cevae import cevae
+from benchmarks.ganite.ganite import ganite, ganite_prob
+from benchmarks.fccn import FCCN
 from sklearn.decomposition import PCA
 from sklearn.linear_model import LogisticRegression
 from metrics import calculatePEHE, calculateATE, loglikelihood, iou_ci, pehe_nn
 from visualize import plot_errors, plot_samples, plot_samples_ite, plot_cis, plot_cis_edu
+
 
 
 if __name__ == '__main__':
@@ -49,7 +50,7 @@ if __name__ == '__main__':
     parser.add_argument('--max_steps', type=int, default=10000)               # IHDP: 5k; EDU: 2.5k; News: 10k
     parser.add_argument('--n_samples', type=int, default=500)
     parser.add_argument('--trunc_prob', type=float, default=0.01)
-    parser.add_argument('--metalearner', type=str, default='S')              # S or T
+    parser.add_argument('--metalearner', type=str, default='T')              # S or T
     # Benchmarks
     parser.add_argument('--NOFLITE', type=bool, default=True, action=argparse.BooleanOptionalAction)
     parser.add_argument('--CMGP', type=bool, default=False, action=argparse.BooleanOptionalAction)
@@ -60,7 +61,7 @@ if __name__ == '__main__':
     parser.add_argument('--wandb', type=bool, default=False, action=argparse.BooleanOptionalAction)
     parser.add_argument('--sweep', type=bool, default=False, action=argparse.BooleanOptionalAction)  # For tuning
     parser.add_argument('--visualize', type=bool, default=False, action=argparse.BooleanOptionalAction)
-    parser.add_argument('--dataset', type=str, default='News')  # Synthetic, IHDP, EDU, News, LBIDD
+    parser.add_argument('--dataset', type=str, default='IHDP')  # Synthetic, IHDP, EDU, News, LBIDD
     parser.add_argument('--iterations', type=int, default=1)
     parser_args = parser.parse_args()
 
@@ -97,6 +98,7 @@ if __name__ == '__main__':
         'wandb': parser_args.wandb,
         'NOFLITE': parser_args.NOFLITE,
         'CMGP': parser_args.CMGP,
+        # 'BART': parser_args.BART,
         'CEVAE': parser_args.CEVAE,
         'GANITE': parser_args.GANITE,
         'FCCN': parser_args.FCCN,
@@ -142,26 +144,36 @@ if __name__ == '__main__':
         ll_cmgp = np.zeros(iterator.__len__())
         if params['dataset'] == 'SyntheticCI' or params['dataset'] == 'EDU' or params['dataset'] == 'IHDP':
             iou_cmgp = np.zeros(iterator.__len__())
+            accuracy_cmgp = np.zeros(iterator.__len__())
+        coverage_cmgp = np.zeros(iterator.__len__())
     if params['CEVAE']:
         pehe_cevae = np.zeros(iterator.__len__())
         ll_cevae = np.zeros(iterator.__len__())
         if params['dataset'] == 'SyntheticCI' or params['dataset'] == 'EDU' or params['dataset'] == 'IHDP':
             iou_cevae = np.zeros(iterator.__len__())
+            accuracy_cevae = np.zeros(iterator.__len__())
+        coverage_cevae = np.zeros(iterator.__len__())
     if params['GANITE']:
         pehe_ganite = np.zeros(iterator.__len__())
         ll_ganite = np.zeros(iterator.__len__())
         if params['dataset'] == 'SyntheticCI' or params['dataset'] == 'EDU' or params['dataset'] == 'IHDP':
             iou_ganite = np.zeros(iterator.__len__())
+            accuracy_ganite = np.zeros(iterator.__len__())
+        coverage_ganite = np.zeros(iterator.__len__())
     if params['FCCN']:
         pehe_fccn = np.zeros(iterator.__len__())
         ll_fccn = np.zeros(iterator.__len__())
         if params['dataset'] == 'SyntheticCI' or params['dataset'] == 'EDU' or params['dataset'] == 'IHDP':
             iou_fccn = np.zeros(iterator.__len__())
+            accuracy_fccn = np.zeros(iterator.__len__())
+        coverage_fccn = np.zeros(iterator.__len__())
     if params['NOFLITE']:
         pehe_noflite = np.zeros(iterator.__len__())
         ll_noflite = np.zeros(iterator.__len__())
         if params['dataset'] == 'SyntheticCI' or params['dataset'] == 'EDU' or params['dataset'] == 'IHDP':
             iou_noflite = np.zeros(iterator.__len__())
+            accuracy_noflite = np.zeros(iterator.__len__())
+        coverage_noflite = np.zeros(iterator.__len__())
 
     for iter in iterator:
         print('\nIteration ' + str(iter))
@@ -184,7 +196,7 @@ if __name__ == '__main__':
         # Use entire training + validation set in the end:
         x_train, yf_train, t_train = dm.dataset.get_train_val_data()
         x_val, yf_val, t_val = dm.dataset.get_val_data()
-        x_test, yf_test, ycf_test, t_test = dm.dataset.get_test_data()
+        x_test, yf_test, ycf_test, t_test, ite_sample_test = dm.dataset.get_test_data()
 
         # Define the potential outcomes
         outcomes_test = np.zeros_like(np.hstack((yf_test, ycf_test)))
@@ -192,7 +204,11 @@ if __name__ == '__main__':
         outcomes_test[t_test == 0, 1] = ycf_test[t_test == 0, 0]
         outcomes_test[t_test == 1, 1] = yf_test[t_test == 1, 0]
         outcomes_test[t_test == 1, 0] = ycf_test[t_test == 1, 0]
-        ite_test = outcomes_test[:, 1] - outcomes_test[:, 0]
+        ite_mu_test = outcomes_test[:, 1] - outcomes_test[:, 0]
+
+        # Get optimal treatment (for given utility) to calculate treatment accuracy for IHDP and News:
+        if params['dataset'] == 'EDU' or params['dataset'] == 'IHDP':
+            opt_treatment = dm.opt_treatment
 
         # Benchmarks:
         # CMGP:
@@ -237,35 +253,51 @@ if __name__ == '__main__':
             ite_pred = y1_pred - y0_pred
 
             # Evaluation:
-            PEHE = np.mean(np.square(ite_pred - ite_test))
-            ATE = np.mean(np.square(ite_pred.mean() - ite_test.mean()))
+            PEHE = np.mean(np.square(ite_pred - ite_mu_test))
+            ATE = np.mean(np.square(ite_pred.mean() - ite_mu_test.mean()))
             print('\nPEHE =', np.round(PEHE, 4), '\t\tsqrt(PEHE) =', np.round(np.sqrt(PEHE), 4), '\t\tATE =',
                   np.round(ATE, 4))
             pehe_cmgp[iter] = np.sqrt(PEHE)
             # Log likelihood:
-            loglik = loglikelihood(ite_test, ite_samples_pred)
+            # loglik = loglikelihood(ite_mu_test, ite_samples_pred)
+            loglik = loglikelihood(ite_sample_test, ite_samples_pred)
             print('LL\t =', np.round(loglik, 4))
             ll_cmgp[iter] = loglik
 
+            ite_l_pred = np.percentile(a=ite_samples_pred, q=5, axis=1)
+            ite_r_pred = np.percentile(a=ite_samples_pred, q=95, axis=1)
             if params['dataset'] == 'SyntheticCI' or params['dataset'] == 'EDU' or params['dataset'] == 'IHDP':
-                ite_l_pred = np.percentile(a=ite_samples_pred, q=5, axis=1)
-                ite_r_pred = np.percentile(a=ite_samples_pred, q=95, axis=1)
                 iou = iou_ci(dm.ite_l_test.numpy()[:, 0], dm.ite_r_test.numpy()[:, 0], ite_l_pred, ite_r_pred)
 
                 iou_cmgp[iter] = iou
                 print('IoU = ', np.round(iou, 4))
 
+                # Assign treatments based on highest expected utility
+                if params['dataset'] == 'IHDP':
+                    expected_utility = ((ite_samples_pred - 4) ** 3).mean(axis=1)
+                elif params['dataset'] == 'EDU':
+                    expected_utility = ((ite_samples_pred - 1) ** 3).mean(axis=1)
+                pred_opt_treatment = np.zeros_like(expected_utility)
+                pred_opt_treatment[expected_utility > 0] = 1
+                treatment_accuracy = (pred_opt_treatment == opt_treatment).mean()
+                accuracy_cmgp[iter] = treatment_accuracy
+                print('Treatment accuracy = ', np.round(treatment_accuracy, 4))
+
+            coverage = np.mean((ite_l_pred <= ite_sample_test) * (ite_sample_test <= ite_r_pred))
+            coverage_cmgp[iter] = coverage
+            print('Coverage = ', np.round(coverage, 4))
+
             if params['visualize']:
                 # plot_errors(outcomes_test, np.vstack((y0_pred, y1_pred)).T)
                 # plot_samples(yf_test, ycf_test, t_test, y0_pred, y1_pred, y0_posteriors, y1_posteriors)
-                plot_samples_ite(ite_test, np.array(ite_samples_pred))
+                plot_samples_ite(ite_mu_test, np.array(ite_samples_pred))
 
-                loglik = loglikelihood(ite_test, ite_samples_pred, return_average=False)
+                loglik = loglikelihood(ite_mu_test, ite_samples_pred, return_average=False)
                 sns.kdeplot(loglik, fill=True, alpha=0.5, cut=0, color='pink')
                 plt.show()
 
                 if params['dataset'] == 'SyntheticCI' or params['dataset'] == 'EDU' or params['dataset'] == 'IHDP':
-                    plot_cis(ite_test, dm.ite_l_test.numpy(), dm.ite_r_test.numpy(), ite_pred, ite_l_pred, ite_r_pred)
+                    plot_cis(ite_mu_test, dm.ite_l_test.numpy(), dm.ite_r_test.numpy(), ite_pred, ite_l_pred, ite_r_pred)
 
                     plt.plot(dm.ite_l_test, ite_l_pred, '.', color='green', alpha=0.4)
                     plt.plot(dm.ite_r_test, ite_r_pred, '.', color='orange', alpha=0.4)
@@ -288,6 +320,20 @@ if __name__ == '__main__':
                     itv1 = ite_r_pred - ite_l_pred
 
                     plot_cis_edu(itv0, itv1, x_test[:, 23])
+
+        # # BART
+        # if params['BART']:
+        #     print('\n---- BART ---------------------')
+
+            # model = pm.Model()
+            # with pm.Model() as model:
+            #     # x_train_cmgp, t_train,
+            #     mu = pmb.BART("mu", X=x_train, Y=yf_train[:, 0], m=1)
+            #     # μ = pm.Deterministic("μ", pm.math.exp(μ_))
+            #     normal = pm.Normal("normal", mu=mu)
+            #     # y_pred = pm.Poisson("y_pred", mu=μ, observed=y_data)
+            #     # idata_coal = pm.sample(random_seed=RANDOM_SEED)
+            #     y_pred = pm.sample(
 
         # CEVAE:
         if params['CEVAE']:
@@ -320,32 +366,49 @@ if __name__ == '__main__':
             ite_pred = ite_samples_pred.mean(axis=0)
 
             # Evaluation:
-            PEHE = np.mean(np.square(ite_pred - ite_test))
-            ATE = np.mean(np.square(ite_pred.mean() - ite_test.mean()))
+            PEHE = np.mean(np.square(ite_pred - ite_mu_test))
+            ATE = np.mean(np.square(ite_pred.mean() - ite_mu_test.mean()))
             print('\nPEHE =', np.round(PEHE, 4), '\t\tsqrt(PEHE) =', np.round(np.sqrt(PEHE), 4), '\t\tATE =', np.round(ATE, 4))
             pehe_cevae[iter] = np.sqrt(PEHE)
             # Log likelihood:
-            loglik = loglikelihood(ite_test, ite_samples_pred)
+            # loglik = loglikelihood(ite_mu_test, ite_samples_pred)
+            loglik = loglikelihood(ite_sample_test, ite_samples_pred)
             print('LL\t =', np.round(loglik, 4))
             ll_cevae[iter] = loglik
+
+            ite_l_pred = np.percentile(a=ite_samples_pred, q=5, axis=0)
+            ite_r_pred = np.percentile(a=ite_samples_pred, q=95, axis=0)
             if params['dataset'] == 'SyntheticCI' or params['dataset'] == 'EDU' or params['dataset'] == 'IHDP':
-                ite_l_pred = np.percentile(a=ite_samples_pred, q=5, axis=0)
-                ite_r_pred = np.percentile(a=ite_samples_pred, q=95, axis=0)
                 iou = iou_ci(dm.ite_l_test.numpy()[:, 0], dm.ite_r_test.numpy()[:, 0], ite_l_pred, ite_r_pred)
 
                 iou_cevae[iter] = iou
                 print('IoU = ', np.round(iou, 4))
 
+                # Assign treatments based on highest expected utility
+                if params['dataset'] == 'IHDP':
+                    expected_utility = ((ite_samples_pred - 4)**3).mean(axis=0)
+                elif params['dataset'] == 'EDU':
+                    expected_utility = ((ite_samples_pred - 1)**3).mean(axis=0)
+                pred_opt_treatment = np.zeros_like(expected_utility)
+                pred_opt_treatment[expected_utility > 0] = 1
+                treatment_accuracy = (pred_opt_treatment == opt_treatment).mean()
+                accuracy_cevae[iter] = treatment_accuracy
+                print('Treatment accuracy = ', np.round(treatment_accuracy, 4))
+
+            coverage = np.mean((ite_l_pred <= ite_sample_test) * (ite_sample_test <= ite_r_pred))
+            coverage_cevae[iter] = coverage
+            print('Coverage = ', np.round(coverage, 4))
+
             if params['visualize']:
                 # plot_errors(outcomes_test, np.array(ite_pred.repeat((2, 1)).T))
-                plot_samples_ite(ite_test, np.array(ite_samples_pred))
+                plot_samples_ite(ite_mu_test, np.array(ite_samples_pred))
 
-                loglik = loglikelihood(ite_test, ite_samples_pred, return_average=False)
+                loglik = loglikelihood(ite_mu_test, ite_samples_pred, return_average=False)
                 sns.kdeplot(loglik, fill=True, alpha=0.5, cut=0, color='pink')
                 plt.show()
 
                 if params['dataset'] == 'SyntheticCI' or params['dataset'] == 'EDU' or params['dataset'] == 'IHDP':
-                    plot_cis(ite_test, dm.ite_l_test.numpy(), dm.ite_r_test.numpy(), ite_pred, ite_l_pred, ite_r_pred)
+                    plot_cis(ite_mu_test, dm.ite_l_test.numpy(), dm.ite_r_test.numpy(), ite_pred, ite_l_pred, ite_r_pred)
 
                     plt.plot(dm.ite_l_test, ite_l_pred, '.', color='green', alpha=0.4)
                     plt.plot(dm.ite_r_test, ite_r_pred, '.', color='orange', alpha=0.4)
@@ -405,31 +468,48 @@ if __name__ == '__main__':
             ite_pred = ite_samples_pred.mean(axis=1)
 
             # Evaluation:
-            PEHE = np.mean(np.square(ite_pred - ite_test))
-            ATE = np.mean(np.square(ite_pred.mean() - ite_test.mean()))
+            PEHE = np.mean(np.square(ite_pred - ite_mu_test))
+            ATE = np.mean(np.square(ite_pred.mean() - ite_mu_test.mean()))
             print('\nPEHE =', np.round(PEHE, 4), '\t\tsqrt(PEHE) =', np.round(np.sqrt(PEHE), 4), '\t\tATE =', np.round(ATE, 4))
             pehe_ganite[iter] = np.sqrt(PEHE)
             # Log likelihood:
-            loglik = loglikelihood(ite_test, ite_samples_pred)
+            # loglik = loglikelihood(ite_mu_test, ite_samples_pred)
+            loglik = loglikelihood(ite_sample_test, ite_samples_pred)
             print('LL\t =', np.round(loglik, 4))
             ll_ganite[iter] = loglik
+
+            ite_l_pred = np.percentile(a=ite_samples_pred, q=5, axis=1)
+            ite_r_pred = np.percentile(a=ite_samples_pred, q=95, axis=1)
             if params['dataset'] == 'SyntheticCI' or params['dataset'] == 'EDU' or params['dataset'] == 'IHDP':
-                ite_l_pred = np.percentile(a=ite_samples_pred, q=5, axis=1)
-                ite_r_pred = np.percentile(a=ite_samples_pred, q=95, axis=1)
                 iou = iou_ci(dm.ite_l_test.numpy()[:, 0], dm.ite_r_test.numpy()[:, 0], ite_l_pred, ite_r_pred)
 
                 iou_ganite[iter] = iou
                 print('IoU = ', np.round(iou, 4))
 
-            if params['visualize']:
-                plot_samples_ite(ite_test, np.array(ite_samples_pred))
+                # Assign treatments based on highest expected utility
+                if params['dataset'] == 'IHDP':
+                    expected_utility = ((ite_samples_pred - 4) ** 3).mean(axis=1)
+                elif params['dataset'] == 'EDU':
+                    expected_utility = ((ite_samples_pred - 1) ** 3).mean(axis=1)
+                pred_opt_treatment = np.zeros_like(expected_utility)
+                pred_opt_treatment[expected_utility > 0] = 1
+                treatment_accuracy = (pred_opt_treatment == opt_treatment).mean()
+                accuracy_ganite[iter] = treatment_accuracy
+                print('Treatment accuracy = ', np.round(treatment_accuracy, 4))
 
-                loglik = loglikelihood(ite_test, ite_samples_pred, return_average=False)
+            coverage = np.mean((ite_l_pred <= ite_sample_test) * (ite_sample_test <= ite_r_pred))
+            coverage_ganite[iter] = coverage
+            print('Coverage = ', np.round(coverage, 4))
+
+            if params['visualize']:
+                plot_samples_ite(ite_mu_test, np.array(ite_samples_pred))
+
+                loglik = loglikelihood(ite_mu_test, ite_samples_pred, return_average=False)
                 sns.kdeplot(loglik, fill=True, alpha=0.5, cut=0, color='pink')
                 plt.show()
 
                 if params['dataset'] == 'SyntheticCI' or params['dataset'] == 'EDU' or params['dataset'] == 'IHDP':
-                    plot_cis(ite_test, dm.ite_l_test.numpy(), dm.ite_r_test.numpy(), ite_pred, ite_l_pred, ite_r_pred)
+                    plot_cis(ite_mu_test, dm.ite_l_test.numpy(), dm.ite_r_test.numpy(), ite_pred, ite_l_pred, ite_r_pred)
 
                     plt.plot(dm.ite_l_test, ite_l_pred, '.', color='green', alpha=0.4)
                     plt.plot(dm.ite_r_test, ite_r_pred, '.', color='orange', alpha=0.4)
@@ -451,7 +531,7 @@ if __name__ == '__main__':
                 g_losses, _, _, _ = fccn.train(x_train, yf_train, t_train, iters=50000)
             elif params['dataset'] == 'News':
                 fccn = FCCN(params['input_size'], alpha=1e-5, beta=5e-3, EDU=False)  # 1e-5; 5e-3
-                g_losses, _, _, _ = fccn.train(x_train, yf_train, t_train, iters=50000)
+                g_losses, _, _, _ = fccn.train(x_train, yf_train, t_train, iters=20000)
             else:
                 fccn = FCCN(params['input_size'])
                 g_losses, _, _, _ = fccn.train(x_train, yf_train, t_train, iters=50000)
@@ -464,32 +544,49 @@ if __name__ == '__main__':
             ite_pred = ite_samples_pred.mean(axis=1)
 
             # Evaluation:
-            PEHE = np.mean(np.square(ite_pred - ite_test))
-            ATE = np.mean(np.square(ite_pred.mean() - ite_test.mean()))
+            PEHE = np.mean(np.square(ite_pred - ite_mu_test))
+            ATE = np.mean(np.square(ite_pred.mean() - ite_mu_test.mean()))
             print('\nPEHE =', np.round(PEHE, 4), '\t\tsqrt(PEHE) =', np.round(np.sqrt(PEHE), 4), '\t\tATE =', np.round(ATE, 4))
             pehe_fccn[iter] = np.sqrt(PEHE)
             # Log likelihood:
-            loglik = loglikelihood(ite_test, ite_samples_pred)
+            # loglik = loglikelihood(ite_mu_test, ite_samples_pred)
+            loglik = loglikelihood(ite_sample_test, ite_samples_pred)
             print('LL\t =', np.round(loglik, 4))
             ll_fccn[iter] = loglik
+
+            ite_l_pred = np.percentile(a=ite_samples_pred, q=5, axis=1)
+            ite_r_pred = np.percentile(a=ite_samples_pred, q=95, axis=1)
             if params['dataset'] == 'SyntheticCI' or params['dataset'] == 'EDU' or params['dataset'] == 'IHDP':
-                ite_l_pred = np.percentile(a=ite_samples_pred, q=5, axis=1)
-                ite_r_pred = np.percentile(a=ite_samples_pred, q=95, axis=1)
                 iou = iou_ci(dm.ite_l_test.numpy()[:, 0], dm.ite_r_test.numpy()[:, 0], ite_l_pred, ite_r_pred)
 
                 iou_fccn[iter] = iou
                 print('IoU = ', np.round(iou, 4))
 
+                # Assign treatments based on highest expected utility
+                if params['dataset'] == 'IHDP':
+                    expected_utility = ((ite_samples_pred - 4) ** 3).mean(axis=1)
+                elif params['dataset'] == 'EDU':
+                    expected_utility = ((ite_samples_pred - 1) ** 3).mean(axis=1)
+                pred_opt_treatment = np.zeros_like(expected_utility)
+                pred_opt_treatment[expected_utility > 0] = 1
+                treatment_accuracy = (pred_opt_treatment == opt_treatment).mean()
+                accuracy_fccn[iter] = treatment_accuracy
+                print('Treatment accuracy = ', np.round(treatment_accuracy, 4))
+
+            coverage = np.mean((ite_l_pred <= ite_sample_test) * (ite_sample_test <= ite_r_pred))
+            coverage_fccn[iter] = coverage
+            print('Coverage = ', np.round(coverage, 4))
+
             if params['visualize']:
                 # plot_errors(outcomes_test, np.array(ite_pred.repeat((2, 1)).T))
-                # plot_samples_ite(ite_test, np.array(ite_samples_pred))
+                # plot_samples_ite(ite_mu_test, np.array(ite_samples_pred))
 
-                loglik = loglikelihood(ite_test, ite_samples_pred, return_average=False)
+                loglik = loglikelihood(ite_mu_test, ite_samples_pred, return_average=False)
                 sns.kdeplot(loglik, fill=True, alpha=0.5, cut=0, color='pink')
                 plt.show()
 
                 if params['dataset'] == 'SyntheticCI' or params['dataset'] == 'EDU' or params['dataset'] == 'IHDP':
-                    plot_cis(ite_test, dm.ite_l_test.numpy(), dm.ite_r_test.numpy(), ite_pred, ite_l_pred, ite_r_pred)
+                    plot_cis(ite_mu_test, dm.ite_l_test.numpy(), dm.ite_r_test.numpy(), ite_pred, ite_l_pred, ite_r_pred)
 
                     plt.plot(dm.ite_l_test, ite_l_pred, '.', color='green', alpha=0.4)
                     plt.plot(dm.ite_r_test, ite_r_pred, '.', color='orange', alpha=0.4)
@@ -672,7 +769,8 @@ if __name__ == '__main__':
                 # samples_pred = np.stack((y0_posteriors, y1_posteriors), axis=-1)
                 ite_samples_pred = y1_posteriors - y0_posteriors
                 ite_pred = ite_samples_pred.mean(axis=1)
-                loglik = loglikelihood(ite_test, ite_samples_pred)
+                # loglik = loglikelihood(ite_mu_test, ite_samples_pred)
+                loglik = loglikelihood(ite_sample_test, ite_samples_pred)
                 print('LL\t =', np.round(loglik, 4))
                 ll_noflite[iter] = loglik
                 if params['wandb']:
@@ -680,15 +778,15 @@ if __name__ == '__main__':
                 print('LL PO -- T=0\t =', np.round(loglikelihood(outcomes_test[:, 0], y0_posteriors), 4))
                 print('LL PO -- T=1\t =', np.round(loglikelihood(outcomes_test[:, 1], y1_posteriors), 4))
 
+                # Todo: check if better results with additional truncation
+                # ite_l_pred = np.percentile(a=ite_samples_pred, q=5, axis=1)
+                # ite_r_pred = np.percentile(a=ite_samples_pred, q=95, axis=1)
+                # Adjusted 5/95 percentiles because we work with truncated normal
+                # ite_l_pred = np.quantile(a=ite_samples_pred, q=(1 - 90/99.5)/2, axis=1)
+                # ite_r_pred = np.quantile(a=ite_samples_pred, q=1 - (1 - 90/99.5)/2, axis=1)
+                ite_l_pred = np.quantile(a=ite_samples_pred, q=0.05, axis=1)
+                ite_r_pred = np.quantile(a=ite_samples_pred, q=0.95, axis=1)
                 if params['dataset'] == 'SyntheticCI' or params['dataset'] == 'EDU' or params['dataset'] == 'IHDP':
-                    # Todo: check if better results with additional truncation
-                    # ite_l_pred = np.percentile(a=ite_samples_pred, q=5, axis=1)
-                    # ite_r_pred = np.percentile(a=ite_samples_pred, q=95, axis=1)
-                    # Adjusted 5/95 percentiles because we work with truncated normal
-                    # ite_l_pred = np.quantile(a=ite_samples_pred, q=(1 - 90/99.5)/2, axis=1)
-                    # ite_r_pred = np.quantile(a=ite_samples_pred, q=1 - (1 - 90/99.5)/2, axis=1)
-                    ite_l_pred = np.quantile(a=ite_samples_pred, q=0.05, axis=1)
-                    ite_r_pred = np.quantile(a=ite_samples_pred, q=0.95, axis=1)
                     iou = iou_ci(dm.ite_l_test.numpy()[:, 0], dm.ite_r_test.numpy()[:, 0], ite_l_pred, ite_r_pred)
 
                     iou_noflite[iter] = iou
@@ -696,15 +794,34 @@ if __name__ == '__main__':
                     if params['wandb']:
                         wandb.log({'IoU': iou})
 
+                    # Assign treatments based on highest expected utility
+                    if params['dataset'] == 'IHDP':
+                        expected_utility = ((ite_samples_pred - 4) ** 3).mean(axis=1)
+                    elif params['dataset'] == 'EDU':
+                        expected_utility = ((ite_samples_pred - 1) ** 3).mean(axis=1)
+                    pred_opt_treatment = np.zeros_like(expected_utility)
+                    pred_opt_treatment[expected_utility > 0] = 1
+                    treatment_accuracy = (pred_opt_treatment == opt_treatment).mean()
+                    accuracy_noflite[iter] = treatment_accuracy
+                    print('Treatment accuracy = ', np.round(treatment_accuracy, 4))
+                    if params['wandb']:
+                        wandb.log({'Treatment accuracy': treatment_accuracy})
+
+                coverage = np.mean((ite_l_pred <= ite_sample_test) * (ite_sample_test <= ite_r_pred))
+                coverage_noflite[iter] = coverage
+                print('Coverage = ', np.round(coverage, 4))
+                if params['wandb']:
+                    wandb.log({'Coverage': coverage})
+
                 # Visualizations
                 if params['visualize']:
                     plot_errors(outcomes_test, outcomes_pred)
 
                     plot_samples(yf_test, ycf_test, t_test, y0_pred, y1_pred, y0_posteriors, y1_posteriors)
 
-                    plot_samples_ite(ite_test, ite_samples_pred)
+                    plot_samples_ite(ite_mu_test, ite_samples_pred)
 
-                    logliks = loglikelihood(ite_test, ite_samples_pred, return_average=False)
+                    logliks = loglikelihood(ite_mu_test, ite_samples_pred, return_average=False)
                     sns.kdeplot(logliks, fill=True, alpha=0.5, cut=0, color='pink')
                     plt.show()
 
@@ -801,7 +918,7 @@ if __name__ == '__main__':
                         plt.show()
 
                     if params['dataset'] == 'SyntheticCI' or params['dataset'] == 'EDU' or params['dataset'] == 'IHDP':
-                        plot_cis(ite_test, dm.ite_l_test.numpy(), dm.ite_r_test.numpy(), ite_pred, ite_l_pred,
+                        plot_cis(ite_mu_test, dm.ite_l_test.numpy(), dm.ite_r_test.numpy(), ite_pred, ite_l_pred,
                                  ite_r_pred)
 
                         plt.figure(dpi=200)
@@ -837,30 +954,40 @@ if __name__ == '__main__':
             print('\tLL: ', np.round(ll_cmgp.mean(), 4), np.round(sem(ll_cmgp), 4))
             if params['dataset'] == 'SyntheticCI' or params['dataset'] == 'EDU' or params['dataset'] == 'IHDP':
                 print('\tIoU: ', np.round(iou_cmgp.mean(), 4), np.round(sem(iou_cmgp), 4))
+                print('\tAccuracy: ', np.round(accuracy_cmgp.mean(), 4), np.round(sem(accuracy_cmgp), 4))
+            print('\tCoverage: ', np.round(coverage_cmgp.mean(), 4), np.round(sem(coverage_cmgp), 4))
         if params['CEVAE']:
             print('CEVAE')
             print('\tsqrt(PEHE): ', np.round(pehe_cevae.mean(), 4), np.round(sem(pehe_cevae), 4))
             print('\tLL: ', np.round(ll_cevae.mean(), 4), np.round(sem(ll_cevae), 4))
             if params['dataset'] == 'SyntheticCI' or params['dataset'] == 'EDU' or params['dataset'] == 'IHDP':
                 print('\tIoU: ', np.round(iou_cevae.mean(), 4), np.round(sem(iou_cevae), 4))
+                print('\tAccuracy: ', np.round(accuracy_cevae.mean(), 4), np.round(sem(accuracy_cevae), 4))
+            print('\tCoverage: ', np.round(coverage_cevae.mean(), 4), np.round(sem(coverage_cevae), 4))
         if params['GANITE']:
             print('GANITE')
             print('\tsqrt(PEHE): ', np.round(pehe_ganite.mean(), 4), np.round(sem(pehe_ganite), 4))
             print('\tLL: ', np.round(ll_ganite.mean(), 4), np.round(sem(ll_ganite), 4))
             if params['dataset'] == 'SyntheticCI' or params['dataset'] == 'EDU' or params['dataset'] == 'IHDP':
                 print('\tIoU: ', np.round(iou_ganite.mean(), 4), np.round(sem(iou_ganite), 4))
+                print('\tAccuracy: ', np.round(accuracy_ganite.mean(), 4), np.round(sem(accuracy_ganite), 4))
+            print('\tCoverage: ', np.round(coverage_ganite.mean(), 4), np.round(sem(coverage_ganite), 4))
         if params['FCCN']:
             print('FCCN')
             print('\tsqrt(PEHE): ', np.round(pehe_fccn.mean(), 4), np.round(sem(pehe_fccn), 4))
             print('\tLL: ', np.round(ll_fccn.mean(), 4), np.round(sem(ll_fccn), 4))
             if params['dataset'] == 'SyntheticCI' or params['dataset'] == 'EDU' or params['dataset'] == 'IHDP':
                 print('\tIoU: ', np.round(iou_fccn.mean(), 4), np.round(sem(iou_fccn), 4))
+            print('\tCoverage: ', np.round(coverage_fccn.mean(), 4), np.round(sem(coverage_fccn), 4))
+            print('\tAccuracy: ', np.round(accuracy_fccn.mean(), 4), np.round(sem(accuracy_fccn), 4))
         if params['NOFLITE']:
             print('NOFLITE')
             print('\tsqrt(PEHE): ', np.round(pehe_noflite.mean(), 4), np.round(sem(pehe_noflite), 4))
             print('\tLL: ', np.round(ll_noflite.mean(), 4), np.round(sem(ll_noflite), 4))
             if params['dataset'] == 'SyntheticCI' or params['dataset'] == 'EDU' or params['dataset'] == 'IHDP':
                 print('\tIoU: ', np.round(iou_noflite.mean(), 4), np.round(sem(iou_noflite), 4))
+                print('\tAccuracy: ', np.round(accuracy_noflite.mean(), 4), np.round(sem(accuracy_noflite), 4))
+            print('\tCoverage: ', np.round(coverage_noflite.mean(), 4), np.round(sem(coverage_noflite), 4))
             if params['wandb']:
                 wandb.log({'PEHE Average': pehe_noflite.mean()})
                 wandb.log({'PEHE SE': sem(pehe_noflite)})
@@ -869,3 +996,7 @@ if __name__ == '__main__':
                 if params['dataset'] == 'SyntheticCI' or params['dataset'] == 'EDU' or params['dataset'] == 'IHDP':
                     wandb.log({'IoU Average': iou_noflite.mean()})
                     wandb.log({'IoU SE': sem(iou_noflite)})
+                    wandb.log({'Accuracy Average': accuracy_noflite.mean()})
+                    wandb.log({'Accuracy SE': sem(accuracy_noflite)})
+                wandb.log({'Coverage Average': coverage_noflite.mean()})
+                wandb.log({'Coverage SE': sem(coverage_noflite)})
